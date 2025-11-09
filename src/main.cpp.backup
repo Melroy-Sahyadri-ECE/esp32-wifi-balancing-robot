@@ -1,0 +1,821 @@
+/*
+ * esp32_wifi_balancing_robot.ino
+ *
+ *  Created on: 23.02.2021
+ *      Author: anonymous
+ */
+ 
+#include <Wire.h>
+#include <WiFi.h>
+#include <ArduinoOTA.h>
+#include <Arduino.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include "Control.h"
+#include "MPU6050.h"
+#include "Motors.h"
+#include "defines.h"
+#include "globals.h"
+#include <stdio.h>
+#include "esp_types.h"
+#include "soc/timer_group_struct.h"
+#include "driver/periph_ctrl.h"
+#include "driver/timer.h"
+#include "driver/ledc.h"
+#include "esp32-hal-ledc.h"
+#include <ESP32Servo.h>
+
+// Servo control objects (ONLY for GPIO 18 and 19)
+Servo servo1;
+Servo servo2;
+
+// Servo state tracking
+struct ServoState {
+  int currentAngle;
+  int targetAngle;
+  bool isMoving;
+  unsigned long lastUpdate;
+};
+
+ServoState servo1State = {90, 90, false, 0};
+ServoState servo2State = {90, 90, false, 0};
+
+const char* PARAM_FADER1 = "fader1";
+const char* PARAM_FADER2 = "fader2";
+const char* PARAM_PUSH1 = "push1";
+const char* PARAM_PUSH2 = "push2";
+const char* PARAM_PUSH3 = "push3";
+const char* PARAM_PUSH4 = "push4";
+const char* PARAM_TOGGLE1 = "toggle1";
+const char* PARAM_FADER3 = "fader3";
+const char* PARAM_FADER4 = "fader4";
+const char* PARAM_FADER5 = "fader5";
+const char* PARAM_FADER6 = "fader6";
+const char* PARAM_SERVO1 = "servo1";
+const char* PARAM_SERVO2 = "servo2";
+
+/* Wifi Credentials */
+String sta_ssid = "ROG";     // set Wifi network you want to connect to
+String sta_password = "melroy123";        // set password for Wifi network
+
+unsigned long previousMillis = 0;
+
+AsyncWebServer server(80);
+
+// Simple balancing variables
+float currentAngle = 0;
+float smoothedAngle = 0;
+int motorSpeed = 0;
+unsigned long lastStepTime1 = 0;
+unsigned long lastStepTime2 = 0;
+unsigned long lastPIDUpdate = 0;
+const unsigned long PIDInterval = 5; // 5ms PID update interval for faster response
+
+// Enhanced PID variables for precise control
+float pidSetpoint = 0.0;  // Target angle (0 degrees = upright)
+float pidKp = 800.0;      // Reduced proportional gain for smoother response
+float pidKi = 15.0;       // Reduced integral gain for stability
+float pidKd = 25.0;       // Reduced derivative gain for less jerkiness
+float pidIntegral = 0;
+float pidLastError = 0;
+
+// Enhanced web control variables
+float webThrottle = 0;    // Forward/backward command from web (-100 to +100)
+float webSteering = 0;    // Left/right command from web (-100 to +100)
+float smoothThrottle = 0; // Smoothed throttle for gradual acceleration
+float smoothSteering = 0; // Smoothed steering for smooth turns
+int motor1Speed = 0;      // Individual motor speeds
+int motor2Speed = 0;
+
+// Control sensitivity settings
+float throttleSensitivity = 0.6;  // Reduced throttle response for smoother control
+float steeringSensitivity = 1.5;  // Increased steering response for better turning
+float smoothingFactor = 0.08;     // Increased smoothing for less jerkiness
+
+void initMPU6050() {
+  MPU6050_setup();
+  delay(500);
+  MPU6050_calibrate();
+}
+
+// Servo utility functions
+bool setServoAngle(int servoNum, int angle);
+int getServoAngle(int servoNum);
+int validateAngle(int angle);
+
+void initTimers();
+void processOSCMsg();
+void motorControl();
+
+void notFound(AsyncWebServerRequest *request) {
+  request->send(404, "text/plain", "Not found");
+}
+
+void setup() {
+  Serial.begin(115200);         // set up serial monitor at 115200 bps
+  Serial.setDebugOutput(true);
+  Serial.println();
+  Serial.println("*ESP32 Camera Balancing Robot*");
+  Serial.println("--------------------------------------------------------");
+
+
+  pinMode(PIN_ENABLE_MOTORS, OUTPUT);
+  digitalWrite(PIN_ENABLE_MOTORS, HIGH);
+  
+  pinMode(PIN_MOTOR1_DIR, OUTPUT);
+  pinMode(PIN_MOTOR1_STEP, OUTPUT);
+  pinMode(PIN_MOTOR2_DIR, OUTPUT);
+  pinMode(PIN_MOTOR2_STEP, OUTPUT);
+  pinMode(PIN_SERVO, OUTPUT);
+
+  // Simple motor initialization
+  Serial.println("Initializing motors...");
+  digitalWrite(PIN_ENABLE_MOTORS, HIGH); // Start with motors disabled
+  digitalWrite(PIN_MOTOR1_DIR, LOW);
+  digitalWrite(PIN_MOTOR2_DIR, LOW);
+  digitalWrite(PIN_MOTOR1_STEP, LOW);
+  digitalWrite(PIN_MOTOR2_STEP, LOW);
+
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LOW);
+
+  pinMode(PIN_WIFI_LED, OUTPUT);
+  digitalWrite(PIN_WIFI_LED, LOW);
+  
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+
+  ledcSetup(6, 50, 16); // channel 6, 50 Hz, 16-bit width
+  ledcAttachPin(PIN_SERVO, 6);   // GPIO 22 assigned to channel 1
+  delay(50);
+  ledcWrite(6, SERVO_AUX_NEUTRO);
+  
+  Wire.begin();
+  initMPU6050();
+
+  // Initialize servo motors (GPIO 18 and 19 only)
+  Serial.println("Initializing servo motors...");
+  servo1.attach(18);  // GPIO 18
+  servo2.attach(19);  // GPIO 19
+  servo1.write(servo1State.currentAngle);
+  servo2.write(servo2State.currentAngle);
+  Serial.println("Servos initialized to center position (90°)");
+
+  // Set NodeMCU Wifi hostname based on chip mac address
+  char chip_id[15];
+  snprintf(chip_id, 15, "%04X", (uint16_t)(ESP.getEfuseMac()>>32));
+  String hostname = "esp32brobot-" + String(chip_id);
+
+  Serial.println();
+  Serial.println("Hostname: "+hostname);
+
+  // first, set NodeMCU as STA mode to connect with a Wifi network
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);  // Clear any previous connection
+  delay(1000);
+  
+  Serial.println("");
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(sta_ssid);
+  Serial.print("Password: ");
+  Serial.println(sta_password);
+  
+  WiFi.begin(sta_ssid.c_str(), sta_password.c_str());
+
+  // try to connect with Wifi network about 15 seconds (increased timeout)
+  unsigned long currentMillis = millis();
+  previousMillis = currentMillis;
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && currentMillis - previousMillis <= 15000) {
+    delay(500);
+    Serial.print(".");
+    currentMillis = millis();
+    attempts++;
+    
+    // Print WiFi status for debugging
+    if (attempts % 10 == 0) {
+      Serial.println();
+      Serial.print("WiFi Status: ");
+      Serial.println(WiFi.status());
+    }
+  }
+
+  // Enhanced WiFi connection handling
+  IPAddress myIP;
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("");
+    Serial.println("✅ *WiFi-STA-Mode Connected*");
+    Serial.print("🌐 Robot IP Address: ");
+    myIP = WiFi.localIP();
+    Serial.println(myIP);
+    Serial.println("🎮 Open this IP in your browser to control the robot!");
+    digitalWrite(PIN_WIFI_LED, HIGH);    // Wifi LED on when connected
+    delay(1000);
+  } else {
+    Serial.println("");
+    Serial.println("❌ WiFi connection failed to " + sta_ssid);
+    Serial.println("🔄 Retrying connection...");
+    
+    // Try one more time with longer timeout
+    WiFi.begin(sta_ssid.c_str(), sta_password.c_str());
+    delay(10000);
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("✅ WiFi connected on retry!");
+      myIP = WiFi.localIP();
+      Serial.print("🌐 Robot IP Address: ");
+      Serial.println(myIP);
+      digitalWrite(PIN_WIFI_LED, HIGH);
+    } else {
+      Serial.println("❌ WiFi connection failed completely");
+      Serial.println("⚠️  Check network name and password");
+      digitalWrite(PIN_WIFI_LED, LOW);
+      // Don't create AP mode - force connection to your network
+      while(true) {
+        delay(5000);
+        Serial.println("🔄 Retrying WiFi connection...");
+        WiFi.begin(sta_ssid.c_str(), sta_password.c_str());
+        delay(10000);
+        if (WiFi.status() == WL_CONNECTED) {
+          myIP = WiFi.localIP();
+          Serial.print("✅ Connected! IP: ");
+          Serial.println(myIP);
+          digitalWrite(PIN_WIFI_LED, HIGH);
+          break;
+        }
+      }
+    }
+  }
+
+
+  // Main control page
+  server.on("/", HTTP_GET, [] (AsyncWebServerRequest *request) {
+    String html = "<!DOCTYPE html><html><head><title>ESP32 Balancing Robot Control</title>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<style>";
+    html += "body { font-family: Arial; text-align: center; background: #f0f0f0; margin: 0; padding: 20px; }";
+    html += ".container { max-width: 400px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }";
+    html += "h1 { color: #333; margin-bottom: 30px; }";
+    html += ".control-group { margin: 20px 0; }";
+    html += ".control-label { font-weight: bold; margin-bottom: 10px; display: block; }";
+    html += ".slider { width: 100%; height: 40px; border-radius: 20px; background: #ddd; outline: none; -webkit-appearance: none; }";
+    html += ".slider::-webkit-slider-thumb { appearance: none; width: 30px; height: 30px; border-radius: 50%; background: #4CAF50; cursor: pointer; }";
+    html += ".value-display { font-size: 18px; font-weight: bold; color: #333; margin: 10px 0; }";
+    html += ".button { background: #4CAF50; color: white; padding: 15px 30px; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; margin: 5px; }";
+    html += ".button:hover { background: #45a049; }";
+    html += ".status { background: #e7f3ff; padding: 10px; border-radius: 5px; margin: 20px 0; }";
+    html += "</style></head><body>";
+    html += "<div class='container'>";
+    html += "<h1>🤖 Balancing Robot Control</h1>";
+    html += "<div class='control-group'>";
+    html += "<label class='control-label'>Forward / Backward</label>";
+    html += "<input type='range' min='0' max='100' value='50' class='slider' id='throttleSlider'>";
+    html += "<div class='value-display' id='throttleValue'>0</div>";
+    html += "</div>";
+    html += "<div class='control-group'>";
+    html += "<label class='control-label'>Left / Right</label>";
+    html += "<input type='range' min='0' max='100' value='50' class='slider' id='steeringSlider'>";
+    html += "<div class='value-display' id='steeringValue'>0</div>";
+    html += "</div>";
+    html += "<div class='control-group'>";
+    html += "<label class='control-label'>Servo 1 (GPIO 18)</label>";
+    html += "<input type='range' min='0' max='180' value='90' class='slider' id='servo1Slider'>";
+    html += "<div class='value-display' id='servo1Value'>90°</div>";
+    html += "</div>";
+    html += "<div class='control-group'>";
+    html += "<label class='control-label'>Servo 2 (GPIO 19)</label>";
+    html += "<input type='range' min='0' max='180' value='90' class='slider' id='servo2Slider'>";
+    html += "<div class='value-display' id='servo2Value'>90°</div>";
+    html += "</div>";
+    html += "<div class='control-group'>";
+    html += "<button class='button' onclick='centerControls()'>Center All</button>";
+    html += "<button class='button' onclick='toggleLED()'>Toggle LED</button>";
+    html += "</div>";
+    html += "<div class='status' id='status'>Robot Status: Ready</div>";
+    html += "</div>";
+    html += "<script>";
+    html += "var throttleSlider = document.getElementById('throttleSlider');";
+    html += "var steeringSlider = document.getElementById('steeringSlider');";
+    html += "var throttleValue = document.getElementById('throttleValue');";
+    html += "var steeringValue = document.getElementById('steeringValue');";
+    html += "function updateDisplay() {";
+    html += "var throttleVal = (throttleSlider.value - 50) * 2;";
+    html += "var steeringVal = (steeringSlider.value - 50) * 2;";
+    html += "throttleValue.textContent = throttleVal > 0 ? 'Forward ' + throttleVal : throttleVal < 0 ? 'Backward ' + Math.abs(throttleVal) : 'Stop';";
+    html += "steeringValue.textContent = steeringVal > 0 ? 'Right ' + steeringVal : steeringVal < 0 ? 'Left ' + Math.abs(steeringVal) : 'Straight';";
+    html += "}";
+    html += "function sendCommand() {";
+    html += "var throttle = throttleSlider.value / 100;";
+    html += "var steering = steeringSlider.value / 100;";
+    html += "fetch('/control?fader1=' + throttle + '&fader2=' + steering)";
+    html += ".then(function(response) { return response.text(); })";
+    html += ".then(function(data) { document.getElementById('status').innerHTML = 'Command sent successfully'; })";
+    html += ".catch(function(error) { document.getElementById('status').innerHTML = 'Error: ' + error; });";
+    html += "}";
+    html += "function centerControls() {";
+    html += "throttleSlider.value = 50; steeringSlider.value = 50; servo1Slider.value = 90; servo2Slider.value = 90;";
+    html += "updateDisplay(); updateServo1(); updateServo2(); sendCommand();";
+    html += "}";
+    html += "function toggleLED() {";
+    html += "fetch('/control?push4=1')";
+    html += ".then(function(response) { return response.text(); })";
+    html += ".then(function(data) { document.getElementById('status').innerHTML = 'LED toggled'; });";
+    html += "}";
+    html += "throttleSlider.addEventListener('input', function() { updateDisplay(); sendCommand(); });";
+    html += "steeringSlider.addEventListener('input', function() { updateDisplay(); sendCommand(); });";
+    html += "var servo1Slider = document.getElementById('servo1Slider');";
+    html += "var servo2Slider = document.getElementById('servo2Slider');";
+    html += "var servo1Value = document.getElementById('servo1Value');";
+    html += "var servo2Value = document.getElementById('servo2Value');";
+    html += "function updateServo1() {";
+    html += "var angle = servo1Slider.value;";
+    html += "servo1Value.textContent = angle + '°';";
+    html += "fetch('/control?servo1=' + angle)";
+    html += ".then(function(response) { return response.text(); })";
+    html += ".then(function(data) { document.getElementById('status').innerHTML = 'Servo 1: ' + angle + '°'; })";
+    html += ".catch(function(error) { document.getElementById('status').innerHTML = 'Error: ' + error; });";
+    html += "}";
+    html += "function updateServo2() {";
+    html += "var angle = servo2Slider.value;";
+    html += "servo2Value.textContent = angle + '°';";
+    html += "fetch('/control?servo2=' + angle)";
+    html += ".then(function(response) { return response.text(); })";
+    html += ".then(function(data) { document.getElementById('status').innerHTML = 'Servo 2: ' + angle + '°'; })";
+    html += ".catch(function(error) { document.getElementById('status').innerHTML = 'Error: ' + error; });";
+    html += "}";
+    html += "servo1Slider.addEventListener('input', updateServo1);";
+    html += "servo2Slider.addEventListener('input', updateServo2);";
+    html += "updateDisplay(); setTimeout(centerControls, 1000);";
+    html += "</script></body></html>";
+    request->send(200, "text/html", html);
+  });
+
+  // Control endpoint for commands
+  server.on("/control", HTTP_GET, [] (AsyncWebServerRequest *request) {
+    String inputValue;
+    String inputMessage;
+    OSCnewMessage = 1;
+    
+    // Get value for Forward/Backward
+    if (request->hasParam(PARAM_FADER1)) {
+      OSCpage = 1;
+      inputValue = request->getParam(PARAM_FADER1)->value();
+      inputMessage = PARAM_FADER1;
+      OSCfader[0] = inputValue.toFloat();
+    }
+    // Get value for Right/Left
+    if (request->hasParam(PARAM_FADER2)) {
+      OSCpage = 1;
+      inputValue = request->getParam(PARAM_FADER2)->value();
+      inputMessage = PARAM_FADER2;
+      OSCfader[1] = inputValue.toFloat();
+    }
+    // Get value for Servo0
+    else if (request->hasParam(PARAM_PUSH1)) {
+      OSCpage = 1;
+      inputValue = request->getParam(PARAM_PUSH1)->value();
+      inputMessage = PARAM_PUSH1;
+      if(inputValue.equals("1")) OSCpush[0]=1;
+      else OSCpush[0]=0;
+    }
+    // Get value for Setting
+    else if (request->hasParam(PARAM_PUSH2)) {
+      OSCpage = 2;
+      inputValue = request->getParam(PARAM_PUSH2)->value();
+      inputMessage = PARAM_PUSH2;
+      if(inputValue.equals("1")) OSCpush[2]=1;
+      else OSCpush[2]=0;
+    }
+    // Get value for Buzzer
+    else if (request->hasParam(PARAM_PUSH3)) {
+      inputValue = request->getParam(PARAM_PUSH3)->value();
+      inputMessage = PARAM_PUSH3;
+      if(inputValue.equals("1")) {
+        digitalWrite(PIN_BUZZER, HIGH);
+        delay(150);
+        digitalWrite(PIN_BUZZER, LOW);
+        delay(80);
+        digitalWrite(PIN_BUZZER, HIGH);
+        delay(150);
+        digitalWrite(PIN_BUZZER, LOW);
+        delay(80);
+      }
+    }
+    // Get value for Led
+    else if (request->hasParam(PARAM_PUSH4)) {
+      inputValue = request->getParam(PARAM_PUSH4)->value();
+      inputMessage = PARAM_PUSH4;
+      if(inputValue.equals("1")) digitalWrite(PIN_LED, HIGH);
+      else digitalWrite(PIN_LED, LOW);
+    }
+    // Get value for Servo 1 (GPIO 18) - Enhanced with utility function
+    if (request->hasParam(PARAM_SERVO1)) {
+      inputValue = request->getParam(PARAM_SERVO1)->value();
+      inputMessage = PARAM_SERVO1;
+      int angle = inputValue.toInt();
+      setServoAngle(1, angle);
+    }
+    // Get value for Servo 2 (GPIO 19) - Enhanced with utility function
+    if (request->hasParam(PARAM_SERVO2)) {
+      inputValue = request->getParam(PARAM_SERVO2)->value();
+      inputMessage = PARAM_SERVO2;
+      int angle = inputValue.toInt();
+      setServoAngle(2, angle);
+    }
+    // Get value for mode PRO
+    else if (request->hasParam(PARAM_TOGGLE1)) {
+      OSCpage = 1;
+      inputValue = request->getParam(PARAM_TOGGLE1)->value();
+      inputMessage = PARAM_TOGGLE1;
+      if(inputValue.equals("1")) OSCtoggle[0]=1;
+      else OSCtoggle[0]=0;
+    }
+    // Get value for P-Stability
+    else if (request->hasParam(PARAM_FADER3)) {
+      OSCpage = 2;
+      inputValue = request->getParam(PARAM_FADER3)->value();
+      inputMessage = PARAM_FADER3;
+      OSCfader[0] = inputValue.toFloat();
+    }
+    // Get value for D-Stability
+    else if (request->hasParam(PARAM_FADER4)) {
+      OSCpage = 2;
+      inputValue = request->getParam(PARAM_FADER4)->value();
+      inputMessage = PARAM_FADER4;
+      OSCfader[0] = inputValue.toFloat();
+    }
+    // Get value for P-Speed
+    else if (request->hasParam(PARAM_FADER5)) {
+      OSCpage = 2;
+      inputValue = request->getParam(PARAM_FADER5)->value();
+      inputMessage = PARAM_FADER5;
+      OSCfader[0] = inputValue.toFloat();
+    }
+    // Get value for I-Speed
+    else if (request->hasParam(PARAM_FADER6)) {
+      OSCpage = 2;
+      inputValue = request->getParam(PARAM_FADER6)->value();
+      inputMessage = PARAM_FADER6;
+      OSCfader[0] = inputValue.toFloat();
+    }
+    else {
+      inputValue = "No message sent";
+    }
+    Serial.println(inputMessage+'='+inputValue);
+    Serial.print("OSCfader[0]="); Serial.print(OSCfader[0], 3);
+    Serial.print(" OSCfader[1]="); Serial.println(OSCfader[1], 3);
+    request->send(200, "text/text", "");
+  });
+
+  server.onNotFound (notFound);    // when a client requests an unknown URI (i.e. something other than "/"), call function "handleNotFound"
+  server.begin();                           // actually start the server
+
+  initTimers();
+
+  // default neutral values
+  OSCfader[0] = 0.5;
+  OSCfader[1] = 0.5;
+  OSCfader[2] = 0.5;
+  OSCfader[3] = 0.5;
+
+  // Initialize balancing variables
+  currentAngle = 0;
+  smoothedAngle = 0;
+  motorSpeed = 0;
+  pidIntegral = 0;
+  pidLastError = 0;
+  lastStepTime1 = 0;
+  lastStepTime2 = 0;
+  lastPIDUpdate = 0;
+  
+  // Initialize enhanced web control variables
+  webThrottle = 0;
+  webSteering = 0;
+  smoothThrottle = 0;
+  smoothSteering = 0;
+  motor1Speed = 0;
+  motor2Speed = 0;
+  
+  Serial.println("Simple balancing system initialized. Starting balancing mode...");
+
+  ArduinoOTA.begin();   // enable to receive update/upload firmware via Wifi OTA
+}
+
+void loop() {
+  ArduinoOTA.handle();
+
+  if (OSCnewMessage) {
+    OSCnewMessage = 0;
+    processOSCMsg();
+  }
+
+  unsigned long currentMillis = millis();
+  
+  // PID control loop - runs every 5ms
+  if (currentMillis - lastPIDUpdate >= PIDInterval) {
+    lastPIDUpdate = currentMillis;
+    
+    if (MPU6050_newData()) {
+      MPU6050_read_3axis();
+      
+      // Get angle from MPU6050 (using existing function)
+      timer_value = micros();
+      dt = (timer_value - timer_old) * 0.000001;
+      timer_old = timer_value;
+      
+      float MPU_sensor_angle = MPU6050_getAngle(dt);
+      currentAngle = MPU_sensor_angle + angle_offset;
+      
+      // Enhanced angle smoothing for better accuracy and less jerkiness
+      smoothedAngle += 0.15 * (currentAngle - smoothedAngle); // Increased smoothing
+      
+      // Smooth web control inputs for gradual response
+      smoothThrottle += smoothingFactor * (webThrottle - smoothThrottle);
+      smoothSteering += smoothingFactor * (webSteering - smoothSteering);
+      
+      // Enhanced PID calculation with smoother web control integration
+      float targetAngle = pidSetpoint + (smoothThrottle * throttleSensitivity * 0.06); // Reduced throttle influence
+      float error = targetAngle - smoothedAngle;
+      
+      // Improved integral control with better limits
+      if (abs(error) < 2.0 && abs(smoothedAngle) < 12.0) { // Tighter conditions for integral
+        pidIntegral += error * (PIDInterval / 1000.0);
+      } else if (abs(error) > 8.0) {
+        pidIntegral *= 0.9; // More aggressive integral reduction for large errors
+      }
+      pidIntegral = constrain(pidIntegral, -20, 20); // Tighter integral limits
+      
+      // Smoother derivative calculation
+      float derivative = (error - pidLastError) / (PIDInterval / 1000.0);
+      pidLastError = error;
+      
+      float pidOutput = (pidKp * error) + (pidKi * pidIntegral) + (pidKd * derivative);
+      
+      // Enhanced steering calculation with proper differential control
+      // For left turn: left motor slower/backward, right motor faster/forward
+      // For right turn: right motor slower/backward, left motor faster/forward
+      float steeringCommand = smoothSteering * steeringSensitivity * 1.5; // Increased steering sensitivity
+      
+      // Apply differential steering - left motor is motor1, right motor is motor2
+      motor1Speed = (int)constrain(pidOutput - steeringCommand, -6000, 6000); // Left motor
+      motor2Speed = (int)constrain(pidOutput + steeringCommand, -6000, 6000); // Right motor
+      
+      // Improved deadzone with smoother behavior
+      static bool inDeadzone = false;
+      static int deadzoneCycles = 0;
+      
+      if (!inDeadzone && abs(smoothedAngle) < 0.3 && abs(smoothThrottle) < 3 && abs(smoothSteering) < 1) {
+        deadzoneCycles++;
+        if (deadzoneCycles > 8) { // Longer stabilization period
+          inDeadzone = true;
+          deadzoneCycles = 0;
+        }
+      } else if (inDeadzone && (abs(smoothedAngle) > 0.8 || abs(smoothThrottle) > 5 || abs(smoothSteering) > 2)) {
+        inDeadzone = false;
+        deadzoneCycles = 0;
+      }
+      
+      if (inDeadzone) {
+        motor1Speed = 0;
+        motor2Speed = 0;
+        pidIntegral *= 0.95; // Slower integral decay for smoother transitions
+      }
+      
+      // Comprehensive debug output
+      static int debug_counter = 0;
+      debug_counter++;
+      if (debug_counter >= 400) { // Every 2 seconds (faster PID loop)
+        debug_counter = 0;
+        Serial.print("Angle: ");
+        Serial.print(smoothedAngle, 2);
+        Serial.print("° | Target: ");
+        Serial.print(targetAngle, 2);
+        Serial.print("° | Web T/S: ");
+        Serial.print(webThrottle, 1);
+        Serial.print("/");
+        Serial.print(webSteering, 1);
+        Serial.print(" | Smooth T/S: ");
+        Serial.print(smoothThrottle, 1);
+        Serial.print("/");
+        Serial.print(smoothSteering, 1);
+        Serial.print(" | M1(L)/M2(R): ");
+        Serial.print(motor1Speed);
+        Serial.print("/");
+        Serial.print(motor2Speed);
+        Serial.print(" | Status: ");
+        Serial.println((abs(smoothedAngle) < 45) ? "BALANCING" : "DISABLED");
+      }
+    }
+  }
+  
+  // Motor control - runs continuously for smooth stepping
+  motorControl();
+}
+
+void motorControl() {
+  // Only run motors if angle is reasonable (within ±45 degrees)
+  if (abs(smoothedAngle) < 45.0 && (abs(motor1Speed) > 0 || abs(motor2Speed) > 0)) {
+    // Enable motors
+    digitalWrite(PIN_ENABLE_MOTORS, LOW);
+    
+    // Motor 1 control (Left Motor)
+    if (abs(motor1Speed) > 0) {
+      digitalWrite(PIN_MOTOR1_DIR, motor1Speed > 0 ? HIGH : LOW);
+      unsigned long stepInterval1 = 1000000 / abs(motor1Speed);
+      stepInterval1 = constrain(stepInterval1, 60, 50000); // Lower minimum for faster response
+      
+      if (micros() - lastStepTime1 >= stepInterval1) {
+        lastStepTime1 = micros();
+        digitalWrite(PIN_MOTOR1_STEP, HIGH);
+        delayMicroseconds(4); // Longer pulse for better stepper response
+        digitalWrite(PIN_MOTOR1_STEP, LOW);
+      }
+    }
+    
+    // Motor 2 control (Right Motor)
+    if (abs(motor2Speed) > 0) {
+      digitalWrite(PIN_MOTOR2_DIR, motor2Speed > 0 ? HIGH : LOW);
+      unsigned long stepInterval2 = 1000000 / abs(motor2Speed);
+      stepInterval2 = constrain(stepInterval2, 60, 50000); // Lower minimum for faster response
+      
+      if (micros() - lastStepTime2 >= stepInterval2) {
+        lastStepTime2 = micros();
+        digitalWrite(PIN_MOTOR2_STEP, HIGH);
+        delayMicroseconds(4); // Longer pulse for better stepper response
+        digitalWrite(PIN_MOTOR2_STEP, LOW);
+      }
+    }
+  } else {
+    // Disable motors when not balancing
+    digitalWrite(PIN_ENABLE_MOTORS, HIGH);
+    motor1Speed = 0;
+    motor2Speed = 0;
+    pidIntegral = 0; // Reset integral when motors disabled
+  }
+}
+
+// Enhanced servo control functions
+bool setServoAngle(int servoNum, int angle) {
+  // Validate and clamp angle to acceptable range
+  int validAngle = validateAngle(angle);
+  
+  if (servoNum == 1) {
+    servo1State.targetAngle = validAngle;
+    servo1State.currentAngle = validAngle;
+    servo1State.isMoving = true;
+    servo1State.lastUpdate = millis();
+    servo1.write(validAngle);
+    Serial.print("Servo 1 moved to ");
+    Serial.print(validAngle);
+    Serial.println("°");
+    return true;
+  } else if (servoNum == 2) {
+    servo2State.targetAngle = validAngle;
+    servo2State.currentAngle = validAngle;
+    servo2State.isMoving = true;
+    servo2State.lastUpdate = millis();
+    servo2.write(validAngle);
+    Serial.print("Servo 2 moved to ");
+    Serial.print(validAngle);
+    Serial.println("°");
+    return true;
+  }
+  
+  Serial.print("Error: Invalid servo number ");
+  Serial.println(servoNum);
+  return false;
+}
+
+int getServoAngle(int servoNum) {
+  if (servoNum == 1) {
+    return servo1State.currentAngle;
+  } else if (servoNum == 2) {
+    return servo2State.currentAngle;
+  }
+  return -1; // Invalid servo number
+}
+
+int validateAngle(int angle) {
+  if (angle < 0) {
+    Serial.print("Angle ");
+    Serial.print(angle);
+    Serial.print("° clamped to minimum 0°");
+    Serial.println();
+    return 0;
+  } else if (angle > 180) {
+    Serial.print("Angle ");
+    Serial.print(angle);
+    Serial.print("° clamped to maximum 180°");
+    Serial.println();
+    return 180;
+  }
+  return angle;
+}
+
+void processOSCMsg() {
+  if (OSCpage == 1) {
+    if (modifing_control_parameters)  // We came from the settings screen
+    {
+      OSCfader[0] = 0.5; // default neutral values
+      OSCfader[1] = 0.5; // default neutral values
+      OSCtoggle[0] = 0;  // Normal mode
+      mode = 0;
+      modifing_control_parameters = false;
+    }
+
+    if (OSCmove_mode) {
+      Serial.print("M ");
+      Serial.print(OSCmove_speed);
+      Serial.print(" ");
+      Serial.print(OSCmove_steps1);
+      Serial.print(",");
+      Serial.println(OSCmove_steps2);
+      positionControlMode = true;
+      OSCmove_mode = false;
+      target_steps1 = steps1 + OSCmove_steps1;
+      target_steps2 = steps2 + OSCmove_steps2;
+    } else {
+      positionControlMode = false;
+      
+      // Enhanced web control mapping for precise movement
+      // Forward/Backward: Convert fader to -100 to +100 range
+      webThrottle = (OSCfader[0] - 0.5) * 200.0;
+      webThrottle = constrain(webThrottle, -100, 100);
+      
+      // Left/Right: Enhanced steering with progressive response
+      float steerInput = (OSCfader[1] - 0.5) * 2.0; // -1 to +1 range
+      
+      // Progressive steering curve for better control
+      // Negative values = LEFT turn, Positive values = RIGHT turn
+      if (abs(steerInput) < 0.05) {
+        webSteering = 0; // Smaller dead zone for better response
+      } else if (abs(steerInput) < 0.3) {
+        // Fine control for small movements
+        webSteering = steerInput * 50.0;
+      } else {
+        // Progressive increase for larger movements
+        float sign = (steerInput > 0) ? 1.0 : -1.0;
+        float absInput = abs(steerInput);
+        webSteering = sign * (15.0 + (absInput - 0.3) * 150.0); // 15 to 120 range
+      }
+      
+      webSteering = constrain(webSteering, -100, 100); // Full range steering
+      
+      // Debug output for steering
+      Serial.print("SteerInput="); Serial.print(steerInput, 3);
+      Serial.print(" webSteering="); Serial.println(webSteering, 1);
+    }
+
+    if ((mode == 0) && (OSCtoggle[0])) {
+      // Change to PRO mode
+      max_throttle = MAX_THROTTLE_PRO;
+      max_steering = MAX_STEERING_PRO;
+      max_target_angle = MAX_TARGET_ANGLE_PRO;
+      mode = 1;
+    }
+    if ((mode == 1) && (OSCtoggle[0] == 0)) {
+      // Change to NORMAL mode
+      max_throttle = MAX_THROTTLE;
+      max_steering = MAX_STEERING;
+      max_target_angle = MAX_TARGET_ANGLE;
+      mode = 0;
+    }
+  } else if (OSCpage == 2) { // OSC page 2
+    if (!modifing_control_parameters) {
+      for (uint8_t i = 0; i < 4; i++)
+        OSCfader[i] = 0.5;
+      OSCtoggle[0] = 0;
+
+      modifing_control_parameters = true;
+      //OSC_MsgSend("$P2", 4);
+    }
+    // User could adjust KP, KD, KP_THROTTLE and KI_THROTTLE (fadder3,4,5,6)
+    // Now we need to adjust all the parameters all the times because we dont know what parameter has been moved
+    Kp_user = KP * 2 * OSCfader[0];
+    Kd_user = KD * 2 * OSCfader[1];
+    Kp_thr_user = KP_THROTTLE * 2 * OSCfader[2];
+    Ki_thr_user = KI_THROTTLE * 2 * OSCfader[3];
+    // Send a special telemetry message with the new parameters
+    char auxS[50];
+    sprintf(auxS, "$tP,%d,%d,%d,%d", int(Kp_user * 1000), int(Kd_user * 1000), int(Kp_thr_user * 1000), int(Ki_thr_user * 1000));
+    //OSC_MsgSend(auxS, 50);
+
+
+    // Calibration mode??
+    if (OSCpush[2] == 1) {
+      Serial.print("Calibration MODE ");
+      angle_offset = angle_adjusted_filtered;
+      Serial.println(angle_offset);
+    }
+
+    // Kill robot => Sleep
+    while (OSCtoggle[0] == 1) {
+      //Reset external parameters
+      PID_errorSum = 0;
+      timer_old = millis();
+      setMotorSpeedM1(0);
+      setMotorSpeedM2(0);
+      digitalWrite(PIN_ENABLE_MOTORS, HIGH);  // Disable motors
+    }
+  }
+}
