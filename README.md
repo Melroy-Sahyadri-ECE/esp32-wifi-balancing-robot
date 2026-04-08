@@ -42,11 +42,28 @@ code .
 Connect your ESP32 board to your computer via your USB cable.
 
 ### 4. Build and Upload using PlatformIO
+
+**Option A: Using VS Code UI**
 1. Once the project opens, PlatformIO will automatically initialize and read the `platformio.ini` file.
 2. Allow a few seconds for PlatformIO to download all the necessary toolchains for the ESP32 in the background.
 3. Look for the **blue status bar** at the bottom of your VS Code window.
 4. Click the **Upload** button (the small **Right Arrow** icon `→` on the bottom bar).
 5. PlatformIO will now automatically compile the code and flash it to your ESP32.
+
+**Option B: Using the Command Line**
+If you prefer running commands, you can use the PlatformIO CLI from your terminal inside the project folder:
+- **Build the project:**
+  ```bash
+  pio run
+  ```
+- **Upload to the ESP32:**
+  ```bash
+  pio run -t upload
+  ```
+- **Open Serial Monitor:**
+  ```bash
+  pio device monitor --baud 115200
+  ```
 
 ### 5. Access the Web Controller
 1. Open the **Serial Monitor** in PlatformIO (the **Plug** icon on the bottom blue bar).
